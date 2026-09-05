@@ -395,6 +395,6 @@ export default function App() {
         </section>
       </>}
     </main>
-    <footer className="deployment-proof">Built for thoughtful meal tracking.</footer>
+    <footer className="deployment-proof">Built for thoughtful meal tracking — one meal at a time.</footer>
   </div>;
 }

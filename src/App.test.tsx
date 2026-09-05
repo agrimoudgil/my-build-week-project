@@ -22,7 +22,7 @@ describe("Daily Meal Log V2 P0", () => {
 
   it("shows the deployment proof message", () => {
     render(<App />);
-    expect(screen.getByText("Built for thoughtful meal tracking.")).toBeInTheDocument();
+    expect(screen.getByText("Built for thoughtful meal tracking — one meal at a time.")).toBeInTheDocument();
   });
 
   it("persists analyzing before awaiting confirmation and restores the pending meal", () => {
