@@ -181,3 +181,9 @@ h1 { margin: 0; font-family: "Fraunces", serif; font-size: clamp(40px, 8vw, 58px
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; }
 }
+.deployment-proof {
+  padding: 0 24px 28px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-align: center;
+}
