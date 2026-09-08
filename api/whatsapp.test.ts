@@ -1,67 +1,81 @@
 import twilio from "twilio";
 import { describe, expect, it, vi } from "vitest";
-import { handleWhatsAppWebhook } from "./whatsapp.js";
+import handler, { handleWhatsAppWebhook } from "./whatsapp.js";
 
-const url = "https://example.com/api/whatsapp";
+const webhookUrl = "https://example.com/api/whatsapp";
 const authToken = "test-auth-token";
-const baseFields = { From: "whatsapp:+911234567890", Body: "half bowl rice", NumMedia: "0" };
-const analysis = {
-  sourceText: "half bowl rice",
-  estimate: {
-    items: [{ dishName: "Rice", portion: "half katori", calorieEstimate: 105, calorieMin: 92, calorieMax: 118, assumption: "Assumes half katori of rice.", confidence: "high" as const }],
-    calorieEstimate: 105, calorieMin: 92, calorieMax: 118,
-    assumptions: ["Assumes half katori of rice."], confidence: "high" as const, clarification: null, error: null,
-  },
+const fields = {
+  Body: "half bowl rice",
+  From: "whatsapp:+911234567890",
+  To: "whatsapp:+14155238886",
+  MessageSid: "SM123",
 };
 
-const dependencies = (overrides: Partial<Parameters<typeof handleWhatsAppWebhook>[1]> = {}) => ({
-  validate: () => true,
-  analyzeText: vi.fn().mockResolvedValue(analysis),
-  analyzePhoto: vi.fn().mockResolvedValue(analysis),
-  save: vi.fn().mockResolvedValue(undefined),
-  ...overrides,
-});
+function signedPost(body: Record<string, string> = fields) {
+  return {
+    method: "POST",
+    signature: twilio.getExpectedTwilioSignature(authToken, webhookUrl, body),
+    webhookUrl,
+    fields: body,
+    authToken,
+  };
+}
 
-describe("Twilio WhatsApp webhook", () => {
-  it("rejects an invalid X-Twilio-Signature", async () => {
-    const result = await handleWhatsAppWebhook({ method: "POST", signature: "invalid", url, fields: baseFields, authToken }, dependencies({ validate: () => false }));
-    expect(result).toEqual({ status: 403, xml: '<?xml version="1.0" encoding="UTF-8"?><Response></Response>' });
+describe("Twilio WhatsApp Stage 1 webhook", () => {
+  it("returns a JSON health check for GET", async () => {
+    const response = { setHeader: vi.fn(), status: vi.fn().mockReturnThis(), json: vi.fn() };
+    await handler({ method: "GET", headers: {} } as never, response as never);
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "application/json");
+    expect(response.status).toHaveBeenCalledWith(200);
+    expect(response.json).toHaveBeenCalledWith({ ok: true });
   });
 
-  it("validates and analyzes text input", async () => {
-    const signature = twilio.getExpectedTwilioSignature(authToken, url, baseFields);
-    const deps = dependencies({ validate: twilio.validateRequest });
-    const result = await handleWhatsAppWebhook({ method: "POST", signature, url, fields: baseFields, authToken }, deps);
-    expect(deps.analyzeText).toHaveBeenCalledWith("half bowl rice");
-    expect(deps.save).toHaveBeenCalledWith(baseFields.From, analysis);
+  it("returns valid TwiML for a signed form POST", () => {
+    const result = handleWhatsAppWebhook(signedPost());
     expect(result.status).toBe(200);
+    expect(result.xml).toContain("<Message>Received: half bowl rice</Message>");
+    expect(result.xml).toMatch(/^<\?xml version="1.0" encoding="UTF-8"\?><Response>/);
   });
 
-  it("uses the image path for one photo", async () => {
-    const fields = { ...baseFields, Body: "", NumMedia: "1", MediaUrl0: "https://api.twilio.com/media/1", MediaContentType0: "image/jpeg" };
-    const deps = dependencies();
-    await handleWhatsAppWebhook({ method: "POST", signature: "valid", url, fields, authToken }, deps);
-    expect(deps.analyzePhoto).toHaveBeenCalledWith(fields);
-    expect(deps.analyzeText).not.toHaveBeenCalled();
+  it("accepts a URL-encoded Vercel POST and returns XML with HTTP 200", async () => {
+    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
+    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
+    const response = {
+      setHeader: vi.fn(),
+      status: vi.fn().mockReturnThis(),
+      send: vi.fn(),
+    };
+    const signature = twilio.getExpectedTwilioSignature(authToken, webhookUrl, fields);
+
+    await handler({
+      method: "POST",
+      headers: { "x-twilio-signature": signature },
+      body: new URLSearchParams(fields).toString(),
+    } as never, response as never);
+
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "text/xml; charset=utf-8");
+    expect(response.status).toHaveBeenCalledWith(200);
+    expect(response.send).toHaveBeenCalledWith(expect.stringContaining("<Message>Received: half bowl rice</Message>"));
+    vi.unstubAllEnvs();
   });
 
-  it("explains how to recover from empty input", async () => {
-    const result = await handleWhatsAppWebhook({ method: "POST", signature: "valid", url, fields: { ...baseFields, Body: "" }, authToken }, dependencies());
-    expect(result.xml).toContain("Send a meal description or one clear meal photo and try again.");
+  it("escapes user text in XML", () => {
+    const escapedFields = { ...fields, Body: `<paneer & "rice">` };
+    const result = handleWhatsAppWebhook(signedPost(escapedFields));
+    expect(result.xml).toContain("Received: &lt;paneer &amp; &quot;rice&quot;&gt;");
+    expect(result.xml).not.toContain(escapedFields.Body);
   });
 
-  it("explains how to recover when analysis fails", async () => {
-    const result = await handleWhatsAppWebhook({ method: "POST", signature: "valid", url, fields: baseFields, authToken }, dependencies({ analyzeText: vi.fn().mockRejectedValue(new Error("analysis failed")) }));
-    expect(result.xml).toContain("Add the main foods and portions, then try again.");
+  it("rejects a signed POST with no Body", () => {
+    const bodyWithoutMessage = { From: fields.From, To: fields.To, MessageSid: fields.MessageSid };
+    const result = handleWhatsAppWebhook(signedPost(bodyWithoutMessage));
+    expect(result.status).toBe(400);
+    expect(result.xml).toContain("<Response></Response>");
   });
 
-  it("explains how to recover when storage fails", async () => {
-    const result = await handleWhatsAppWebhook({ method: "POST", signature: "valid", url, fields: baseFields, authToken }, dependencies({ save: vi.fn().mockRejectedValue(new Error("storage failed")) }));
-    expect(result.xml).toContain("I analysed the meal but couldn’t save it. Please try again.");
-  });
-
-  it("returns valid escaped TwiML with the existing calorie result", async () => {
-    const result = await handleWhatsAppWebhook({ method: "POST", signature: "valid", url, fields: baseFields, authToken }, dependencies());
-    expect(result.xml).toBe('<?xml version="1.0" encoding="UTF-8"?><Response><Message>Rice (half katori)\nApproximately 105 kcal\nEstimated range: 92–118 kcal\nStatus: Awaiting review</Message></Response>');
+  it("rejects an invalid signature", () => {
+    const result = handleWhatsAppWebhook({ ...signedPost(), signature: "invalid" });
+    expect(result.status).toBe(403);
+    expect(result.xml).toContain("<Response></Response>");
   });
 });
