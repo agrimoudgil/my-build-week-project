@@ -1,191 +1,211 @@
-import twilio from "twilio";
 import { Readable } from "node:stream";
-import { describe, expect, it, vi } from "vitest";
-import handler, { handleWhatsAppWebhook } from "./whatsapp.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const twilioMocks = vi.hoisted(() => ({
+  createMessage: vi.fn(),
+  createClient: vi.fn(),
+}));
+
+vi.mock("twilio", async (importOriginal) => {
+  const actual = await importOriginal();
+  const realTwilio = (actual as unknown as {
+    default: {
+      getExpectedTwilioSignature: (authToken: string, url: string, params: Record<string, string>) => string;
+      validateRequest: (authToken: string, signature: string, url: string, params: Record<string, string>) => boolean;
+    };
+  }).default;
+  const createClient = Object.assign(
+    (...args: unknown[]) => twilioMocks.createClient(...args),
+    {
+      getExpectedTwilioSignature: realTwilio.getExpectedTwilioSignature,
+      validateRequest: realTwilio.validateRequest,
+    },
+  );
+  return { default: createClient };
+});
+
+import twilio from "twilio";
+import handler from "./whatsapp.js";
 
 const webhookUrl = "https://example.com/api/whatsapp";
+const accountSid = "AC00000000000000000000000000000000";
 const authToken = "test-auth-token";
 const fields = {
-  Body: "half bowl rice",
+  Body: "  2 idli with sambhar  ",
   From: "whatsapp:+911234567890",
   To: "whatsapp:+14155238886",
   MessageSid: "SM123",
 };
 
-function signedPost(body: Record<string, string> = fields) {
+function responseMock() {
   return {
-    method: "POST",
-    signature: twilio.getExpectedTwilioSignature(authToken, webhookUrl, body),
-    webhookUrl,
-    fields: body,
-    authToken,
+    setHeader: vi.fn(),
+    status: vi.fn().mockReturnThis(),
+    send: vi.fn(),
+    json: vi.fn(),
   };
 }
 
+function signature(formFields: Record<string, string>) {
+  return twilio.getExpectedTwilioSignature(authToken, webhookUrl, formFields);
+}
+
+async function post(body: unknown, signedFields: Record<string, string> = fields) {
+  const response = responseMock();
+  await handler({
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-twilio-signature": signature(signedFields),
+    },
+    body,
+  } as never, response as never);
+  return response;
+}
+
 describe("Twilio WhatsApp Stage 1 webhook", () => {
-  it("returns a JSON health check for GET", async () => {
-    const response = { setHeader: vi.fn(), status: vi.fn().mockReturnThis(), json: vi.fn() };
+  beforeEach(() => {
+    vi.stubEnv("TWILIO_ACCOUNT_SID", accountSid);
+    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
+    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
+    twilioMocks.createMessage.mockReset();
+    twilioMocks.createClient.mockReset();
+    twilioMocks.createMessage.mockResolvedValue({ sid: "SM-outbound" });
+    twilioMocks.createClient.mockReturnValue({ messages: { create: twilioMocks.createMessage } });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it("keeps the GET health check unchanged", async () => {
+    const response = responseMock();
     await handler({ method: "GET", headers: {} } as never, response as never);
     expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "application/json");
     expect(response.status).toHaveBeenCalledWith(200);
     expect(response.json).toHaveBeenCalledWith({ ok: true });
+    expect(twilioMocks.createMessage).not.toHaveBeenCalled();
   });
 
-  it("returns valid TwiML for a signed form POST", () => {
-    const result = handleWhatsAppWebhook(signedPost());
-    expect(result.status).toBe(200);
-    expect(result.xml).toContain("<Message>Received: half bowl rice</Message>");
-    expect(result.xml).toMatch(/^<\?xml version="1.0" encoding="UTF-8"\?><Response>/);
-  });
-
-  it("accepts a URL-encoded Vercel POST and returns XML with HTTP 200", async () => {
-    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
-    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
-    const response = {
-      setHeader: vi.fn(),
-      status: vi.fn().mockReturnThis(),
-      send: vi.fn(),
-    };
-    const signature = twilio.getExpectedTwilioSignature(authToken, webhookUrl, fields);
-
-    await handler({
-      method: "POST",
-      headers: { "x-twilio-signature": signature },
-      body: new URLSearchParams(fields).toString(),
-    } as never, response as never);
-
-    expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "text/xml; charset=utf-8");
+  it("sends exactly one outbound echo and returns empty TwiML", async () => {
+    const response = await post(fields);
+    expect(twilioMocks.createClient).toHaveBeenCalledWith(accountSid, authToken);
+    expect(twilioMocks.createMessage).toHaveBeenCalledOnce();
+    expect(twilioMocks.createMessage).toHaveBeenCalledWith({
+      to: fields.From,
+      from: fields.To,
+      body: "Received: 2 idli with sambhar",
+    });
     expect(response.status).toHaveBeenCalledWith(200);
-    expect(response.send).toHaveBeenCalledWith(expect.stringContaining("<Message>Received: half bowl rice</Message>"));
-    vi.unstubAllEnvs();
+    expect(response.setHeader).toHaveBeenCalledWith("Content-Type", "text/xml; charset=utf-8");
+    expect(response.send).toHaveBeenCalledWith('<?xml version="1.0" encoding="UTF-8"?><Response/>');
   });
 
   it.each([
-    ["parsed object", { ...fields, Body: "2 idli with sambhar" }],
-    ["URL-encoded string", new URLSearchParams({ ...fields, Body: "2 idli with sambhar" }).toString()],
-    ["Buffer", Buffer.from(new URLSearchParams({ ...fields, Body: "2 idli with sambhar" }).toString())],
-  ])("accepts a Vercel %s body and returns a non-empty TwiML Message", async (_label, body) => {
-    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
-    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
-    const signedFields = { ...fields, Body: "2 idli with sambhar" };
-    const response = { setHeader: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn() };
-
-    await handler({
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        "x-twilio-signature": twilio.getExpectedTwilioSignature(authToken, webhookUrl, signedFields),
-      },
-      body,
-    } as never, response as never);
-
+    ["URL-encoded string", new URLSearchParams(fields).toString()],
+    ["Buffer", Buffer.from(new URLSearchParams(fields).toString())],
+  ])("parses a Vercel %s body before sending", async (_label, body) => {
+    const response = await post(body);
+    expect(twilioMocks.createMessage).toHaveBeenCalledOnce();
     expect(response.status).toHaveBeenCalledWith(200);
-    expect(response.send).toHaveBeenCalledWith(
-      expect.stringContaining("<Message>Received: 2 idli with sambhar</Message>"),
-    );
-    vi.unstubAllEnvs();
   });
 
-  it("reads an unread raw form stream", async () => {
-    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
-    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
-    const signedFields = { ...fields, Body: "2 idli with sambhar" };
-    const request = Readable.from([new URLSearchParams(signedFields).toString()]) as Readable & Record<string, unknown>;
+  it("reads an unread raw form stream before sending", async () => {
+    const request = Readable.from([new URLSearchParams(fields).toString()]) as Readable & Record<string, unknown>;
     request.method = "POST";
     request.headers = {
       "content-type": "application/x-www-form-urlencoded",
-      "x-twilio-signature": twilio.getExpectedTwilioSignature(authToken, webhookUrl, signedFields),
+      "x-twilio-signature": signature(fields),
     };
-    const response = { setHeader: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn() };
-
+    const response = responseMock();
     await handler(request as never, response as never);
-
+    expect(twilioMocks.createMessage).toHaveBeenCalledOnce();
     expect(response.status).toHaveBeenCalledWith(200);
-    expect(response.send).toHaveBeenCalledWith(
-      expect.stringContaining("<Message>Received: 2 idli with sambhar</Message>"),
-    );
-    vi.unstubAllEnvs();
   });
 
   it("does not reread the stream when request.body is populated", async () => {
-    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
-    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
-    const signedFields = { ...fields, Body: "2 idli with sambhar" };
-    const response = { setHeader: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn() };
     const request = {
       method: "POST",
-      headers: { "x-twilio-signature": twilio.getExpectedTwilioSignature(authToken, webhookUrl, signedFields) },
-      body: signedFields,
+      headers: { "x-twilio-signature": signature(fields) },
+      body: fields,
       async *[Symbol.asyncIterator]() {
         throw new Error("stream must not be read");
       },
     };
-
+    const response = responseMock();
     await handler(request as never, response as never);
-
+    expect(twilioMocks.createMessage).toHaveBeenCalledOnce();
     expect(response.status).toHaveBeenCalledWith(200);
-    vi.unstubAllEnvs();
   });
 
-  it("logs only safe webhook diagnostics", async () => {
-    vi.stubEnv("TWILIO_AUTH_TOKEN", authToken);
-    vi.stubEnv("TWILIO_WEBHOOK_URL", webhookUrl);
-    const signedFields = { ...fields, Body: "2 idli with sambhar" };
-    const signature = twilio.getExpectedTwilioSignature(authToken, webhookUrl, signedFields);
-    const response = { setHeader: vi.fn(), status: vi.fn().mockReturnThis(), send: vi.fn() };
-    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
-
+  it("sends nothing for an invalid signature", async () => {
+    const response = responseMock();
     await handler({
       method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded", "x-twilio-signature": signature },
-      body: signedFields,
+      headers: { "x-twilio-signature": "invalid" },
+      body: fields,
     } as never, response as never);
+    expect(twilioMocks.createMessage).not.toHaveBeenCalled();
+    expect(response.status).toHaveBeenCalledWith(403);
+  });
 
+  it("sends nothing when Body is missing", async () => {
+    const bodyWithoutMessage = { From: fields.From, To: fields.To, MessageSid: fields.MessageSid };
+    const response = await post(bodyWithoutMessage, bodyWithoutMessage);
+    expect(twilioMocks.createMessage).not.toHaveBeenCalled();
+    expect(response.status).toHaveBeenCalledWith(400);
+  });
+
+  it.each([
+    ["From", { ...fields, From: "+911234567890" }],
+    ["To", { ...fields, To: "+14155238886" }],
+  ])("sends nothing when %s is not a WhatsApp address", async (_label, invalidFields) => {
+    const response = await post(invalidFields, invalidFields);
+    expect(twilioMocks.createMessage).not.toHaveBeenCalled();
+    expect(response.status).toHaveBeenCalledWith(400);
+  });
+
+  it("requires TWILIO_ACCOUNT_SID without sending", async () => {
+    vi.stubEnv("TWILIO_ACCOUNT_SID", "");
+    const response = await post(fields);
+    expect(twilioMocks.createMessage).not.toHaveBeenCalled();
+    expect(response.status).toHaveBeenCalledWith(500);
+  });
+
+  it("returns 500 and logs only Twilio error code and status when sending fails", async () => {
+    twilioMocks.createMessage.mockRejectedValue({
+      code: 21610,
+      status: 400,
+      message: fields.Body,
+      moreInfo: `secret-${accountSid}-${authToken}-${fields.From}`,
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const response = await post(fields);
+    expect(response.status).toHaveBeenCalledWith(500);
+    expect(error).toHaveBeenCalledWith({ twilioErrorCode: 21610, twilioErrorStatus: 400 });
+    expect(info).toHaveBeenCalledWith(expect.objectContaining({ outboundSendSucceeded: false }));
+    const logged = JSON.stringify([...error.mock.calls, ...info.mock.calls]);
+    for (const secret of [fields.Body, fields.From, fields.To, fields.MessageSid, accountSid, authToken]) {
+      expect(logged).not.toContain(secret);
+    }
+  });
+
+  it("logs only safe success diagnostics", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    await post(fields);
     expect(info).toHaveBeenCalledOnce();
     expect(info).toHaveBeenCalledWith({
       method: "POST",
       contentType: "application/x-www-form-urlencoded",
       hasBody: true,
       signatureValid: true,
-      responseHasMessage: true,
+      outboundSendSucceeded: true,
     });
     const logged = JSON.stringify(info.mock.calls);
-    expect(logged).not.toContain(signedFields.Body);
-    expect(logged).not.toContain(signedFields.From);
-    expect(logged).not.toContain(signedFields.To);
-    expect(logged).not.toContain(signedFields.MessageSid);
-    expect(logged).not.toContain(authToken);
-    expect(logged).not.toContain(signature);
-
-    info.mockRestore();
-    vi.unstubAllEnvs();
-  });
-
-  it("escapes user text in XML", () => {
-    const escapedFields = { ...fields, Body: `<paneer & "rice">` };
-    const result = handleWhatsAppWebhook(signedPost(escapedFields));
-    expect(result.xml).toContain("Received: &lt;paneer &amp; &quot;rice&quot;&gt;");
-    expect(result.xml).not.toContain(escapedFields.Body);
-  });
-
-  it("returns a useful TwiML message for a signed POST with no Body", () => {
-    const bodyWithoutMessage = { From: fields.From, To: fields.To, MessageSid: fields.MessageSid };
-    const result = handleWhatsAppWebhook(signedPost(bodyWithoutMessage));
-    expect(result.status).toBe(200);
-    expect(result.xml).toContain("<Message>");
-    expect(result.xml).not.toContain("<Response></Response>");
-  });
-
-  it("trims Body before writing the TwiML response", () => {
-    const paddedFields = { ...fields, Body: "  2 idli with sambhar  " };
-    const result = handleWhatsAppWebhook(signedPost(paddedFields));
-    expect(result.status).toBe(200);
-    expect(result.xml).toContain("<Message>Received: 2 idli with sambhar</Message>");
-  });
-
-  it("rejects an invalid signature", () => {
-    const result = handleWhatsAppWebhook({ ...signedPost(), signature: "invalid" });
-    expect(result.status).toBe(403);
-    expect(result.xml).toContain("<Response></Response>");
+    for (const secret of [fields.Body, fields.From, fields.To, fields.MessageSid, accountSid, authToken]) {
+      expect(logged).not.toContain(secret);
+    }
   });
 });
