@@ -9,16 +9,16 @@ type WebhookInput = {
   fields: FormFields;
   authToken?: string;
 };
-type OutboundMessage = {
-  to: string;
-  from: string;
-  body: string;
+type PlainTextReply = {
+  replyText: string;
+  inboundFrom: string;
+  inboundTo: string;
 };
 type WebhookResult = {
   status: number;
   xml: string;
   signatureValid: boolean;
-  outbound?: OutboundMessage;
+  reply?: PlainTextReply;
 };
 
 const emptyTwiml = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
@@ -49,7 +49,11 @@ export function handleWhatsAppWebhook(input: WebhookInput): WebhookResult {
     status: 200,
     xml: emptyTwiml,
     signatureValid: true,
-    outbound: { to: from, from: to, body: `Received: ${body}` },
+    reply: {
+      replyText: `Received: ${body}`,
+      inboundFrom: from,
+      inboundTo: to,
+    },
   };
 }
 
@@ -114,14 +118,20 @@ export default async function handler(request: VercelRequest, response: VercelRe
     authToken: process.env.TWILIO_AUTH_TOKEN,
   });
   let outboundSendSucceeded = false;
-  if (result.outbound) {
+  if (result.reply) {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     if (!accountSid || !authToken) {
-      result = { ...result, status: 500, outbound: undefined };
+      result = { ...result, status: 500, reply: undefined };
     } else {
       try {
-        await twilio(accountSid, authToken).messages.create(result.outbound);
+        const client = twilio(accountSid, authToken);
+        const { replyText, inboundFrom, inboundTo } = result.reply;
+        await client.messages.create({
+          body: replyText,
+          from: inboundTo,
+          to: inboundFrom,
+        });
         outboundSendSucceeded = true;
       } catch (error) {
         const twilioError = error as { code?: unknown; status?: unknown };
@@ -129,7 +139,7 @@ export default async function handler(request: VercelRequest, response: VercelRe
           twilioErrorCode: safeTwilioErrorValue(twilioError.code),
           twilioErrorStatus: safeTwilioErrorValue(twilioError.status),
         });
-        result = { ...result, status: 500, outbound: undefined };
+        result = { ...result, status: 500, reply: undefined };
       }
     }
   }

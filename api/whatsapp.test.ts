@@ -102,6 +102,34 @@ describe("Twilio WhatsApp Stage 1 webhook", () => {
     expect(response.send).toHaveBeenCalledWith('<?xml version="1.0" encoding="UTF-8"?><Response/>');
   });
 
+  it("never forwards inbound template or unrelated form fields to Twilio", async () => {
+    const inboundWithExtraFields = {
+      ...fields,
+      contentSid: "HX-inbound-must-not-be-forwarded",
+      contentVariables: '{"1":"must not be forwarded"}',
+      messagingServiceSid: "MG-inbound-must-not-be-forwarded",
+      template: "must not be forwarded",
+      NumMedia: "0",
+      ProfileName: "Private User",
+    };
+
+    const response = await post(inboundWithExtraFields, inboundWithExtraFields);
+
+    expect(response.status).toHaveBeenCalledWith(200);
+    expect(twilioMocks.createMessage).toHaveBeenCalledOnce();
+    const outbound = twilioMocks.createMessage.mock.calls[0]?.[0];
+    expect(outbound).toEqual({
+      body: "Received: 2 idli with sambhar",
+      from: fields.To,
+      to: fields.From,
+    });
+    expect(Object.keys(outbound)).toEqual(["body", "from", "to"]);
+    expect(outbound).not.toHaveProperty("contentSid");
+    expect(outbound).not.toHaveProperty("contentVariables");
+    expect(outbound).not.toHaveProperty("messagingServiceSid");
+    expect(outbound).not.toHaveProperty("template");
+  });
+
   it.each([
     ["URL-encoded string", new URLSearchParams(fields).toString()],
     ["Buffer", Buffer.from(new URLSearchParams(fields).toString())],
@@ -175,7 +203,7 @@ describe("Twilio WhatsApp Stage 1 webhook", () => {
 
   it("returns 500 and logs only Twilio error code and status when sending fails", async () => {
     twilioMocks.createMessage.mockRejectedValue({
-      code: 21610,
+      code: 21654,
       status: 400,
       message: fields.Body,
       moreInfo: `secret-${accountSid}-${authToken}-${fields.From}`,
@@ -184,7 +212,7 @@ describe("Twilio WhatsApp Stage 1 webhook", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const response = await post(fields);
     expect(response.status).toHaveBeenCalledWith(500);
-    expect(error).toHaveBeenCalledWith({ twilioErrorCode: 21610, twilioErrorStatus: 400 });
+    expect(error).toHaveBeenCalledWith({ twilioErrorCode: 21654, twilioErrorStatus: 400 });
     expect(info).toHaveBeenCalledWith(expect.objectContaining({ outboundSendSucceeded: false }));
     const logged = JSON.stringify([...error.mock.calls, ...info.mock.calls]);
     for (const secret of [fields.Body, fields.From, fields.To, fields.MessageSid, accountSid, authToken]) {
